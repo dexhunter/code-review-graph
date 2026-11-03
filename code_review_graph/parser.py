@@ -7748,131 +7748,185 @@ class CodeParser:
         """Recursively walk the AST and extract nodes/edges."""
         if _depth > self._MAX_AST_DEPTH:
             return
+        # Everything that depends only on ``language`` is resolved once per
+        # walk instead of once per AST node.
+        max_depth = self._MAX_AST_DEPTH
         class_types = set(self._class_types.get(language, []))
         func_types = set(self._function_types.get(language, []))
         import_types = set(self._import_types.get(language, []))
         call_types = set(self._call_types.get(language, []))
+        # Node types that _extract_value_references acts on; for any other
+        # node type it does nothing.
+        value_ref_types = (
+            self._PAIR_TYPES | self._ARRAY_TYPES | self._ARGUMENTS_TYPES
+            | {
+                "shorthand_property_identifier",
+                "assignment_expression", "augmented_assignment", "assignment",
+            }
+        )
+        has_special_constructs = language in (
+            "r", "lua", "luau", "zig", "bash", "elixir", "nix", "hcl",
+            "julia", "verilog", "rust",
+        )
+        is_dart = language == "dart"
+        is_js = language in ("javascript", "typescript", "tsx")
+        is_ts = language in ("typescript", "tsx")
+        is_solidity = language == "solidity"
+        # For languages without per-child special cases, a node whose type no
+        # extractor handles only needs to be recursed into.
+        is_generic = not (
+            has_special_constructs or is_dart or is_js or is_solidity
+        )
+        handled_types = (
+            class_types | func_types | import_types | call_types
+            | value_ref_types
+        )
 
-        for child in root.children:
+        # Walk iteratively with one flat stack of pending nodes. A node's
+        # children are pushed as one batch (reversed so they pop in source
+        # order) on top of a ``None`` marker that restores the parent depth
+        # once the whole batch is done, which keeps the original pre-order.
+        pending = root.children[::-1]
+        pop = pending.pop
+        push = pending.append
+        extend = pending.extend
+        descend = _depth < max_depth
+        while pending:
+            child = pop()
+            if child is None:
+                # Back from a batch of children; their parent could descend.
+                _depth -= 1
+                descend = True
+                continue
             node_type = child.type
 
-            # --- R-specific constructs ---
-            if language == "r" and self._extract_r_constructs(
-                child, node_type, source, language, file_path,
-                nodes, edges, enclosing_class, enclosing_func,
-                import_map, defined_names,
-            ):
+            if is_generic and node_type not in handled_types:
+                # Leaves have nothing to extract or recurse into.
+                if descend and child.child_count:
+                    push(None)
+                    extend(child.children[::-1])
+                    _depth += 1
+                    descend = _depth < max_depth
                 continue
 
-            # --- Lua/Luau-specific constructs ---
-            if language in ("lua", "luau") and self._extract_lua_constructs(
-                child, node_type, source, language, file_path,
-                nodes, edges, enclosing_class, enclosing_func,
-                import_map, defined_names, _depth,
-            ):
-                continue
-
-            # --- Zig-specific constructs ---
-            # Zig's grammar emits PascalCase Decl/VarDecl/FnProto/SuffixExpr
-            # nodes that don't fit the generic class/function/import/call
-            # dispatch. _extract_zig_constructs handles top-level Decl and
-            # TestDecl nodes (functions, structs/unions/enums, @import,
-            # test blocks) and walks call sites itself.
-            if language == "zig" and self._extract_zig_constructs(
-                child, node_type, source, language, file_path,
-                nodes, edges, enclosing_class, enclosing_func,
-                import_map, defined_names, _depth,
-            ):
-                continue
-
-            # --- Bash-specific constructs ---
-            # ``source ./foo.sh`` and ``. ./foo.sh`` are commands in
-            # tree-sitter-bash; re-interpret them as IMPORTS_FROM edges so
-            # cross-script wiring works the same as in other languages.
-            if language == "bash" and node_type == "command":
-                if self._extract_bash_source_command(
-                    child, file_path, edges,
+            if has_special_constructs:
+                # --- R-specific constructs ---
+                if language == "r" and self._extract_r_constructs(
+                    child, node_type, source, language, file_path,
+                    nodes, edges, enclosing_class, enclosing_func,
+                    import_map, defined_names,
                 ):
                     continue
 
-            # --- Elixir-specific constructs ---
-            # Every top-level construct in Elixir is a ``call`` node:
-            # defmodule, def/defp/defmacro, alias/import/require/use, and
-            # ordinary function invocations all share the same node type.
-            # Dispatch via _extract_elixir_constructs so we can tell them
-            # apart by the first-identifier text and still recurse into
-            # bodies with the correct enclosing scope. See: #112
-            if language == "elixir" and node_type == "call":
-                if self._extract_elixir_constructs(
-                    child, source, language, file_path, nodes, edges,
-                    enclosing_class, enclosing_func,
+                # --- Lua/Luau-specific constructs ---
+                if language in ("lua", "luau") and self._extract_lua_constructs(
+                    child, node_type, source, language, file_path,
+                    nodes, edges, enclosing_class, enclosing_func,
                     import_map, defined_names, _depth,
                 ):
                     continue
 
-            # --- Nix-specific constructs ---
-            # Nix bindings (``attrpath = expr;``) are the graph's addressable
-            # things; dispatch via _extract_nix_constructs to flatten dotted
-            # attrpaths into Function nodes and to emit IMPORTS_FROM edges for
-            # flake ``inputs.*.url`` strings and ``import``/``callPackage``
-            # applications. See: #366 follow-up (flake-aware Nix support).
-            if language == "nix" and node_type == "binding":
-                if self._extract_nix_constructs(
-                    child, source, language, file_path, nodes, edges,
-                    enclosing_class, enclosing_func,
+                # --- Zig-specific constructs ---
+                # Zig's grammar emits PascalCase Decl/VarDecl/FnProto/SuffixExpr
+                # nodes that don't fit the generic class/function/import/call
+                # dispatch. _extract_zig_constructs handles top-level Decl and
+                # TestDecl nodes (functions, structs/unions/enums, @import,
+                # test blocks) and walks call sites itself.
+                if language == "zig" and self._extract_zig_constructs(
+                    child, node_type, source, language, file_path,
+                    nodes, edges, enclosing_class, enclosing_func,
                     import_map, defined_names, _depth,
                 ):
                     continue
 
-            # --- HCL/Terraform-specific constructs ---
-            # All Terraform top-level constructs are ``block`` nodes whose
-            # first identifier child labels the block type (resource, module,
-            # variable, data, output, locals, provider, terraform).  Dispatch
-            # via _extract_hcl_constructs to produce Class, Function, and
-            # IMPORTS_FROM/REFERENCES edges.  See issue #199.
-            if language == "hcl" and node_type == "block":
-                if self._extract_hcl_constructs(
-                    child, file_path, nodes, edges,
+                # --- Bash-specific constructs ---
+                # ``source ./foo.sh`` and ``. ./foo.sh`` are commands in
+                # tree-sitter-bash; re-interpret them as IMPORTS_FROM edges so
+                # cross-script wiring works the same as in other languages.
+                if language == "bash" and node_type == "command":
+                    if self._extract_bash_source_command(
+                        child, file_path, edges,
+                    ):
+                        continue
+
+                # --- Elixir-specific constructs ---
+                # Every top-level construct in Elixir is a ``call`` node:
+                # defmodule, def/defp/defmacro, alias/import/require/use, and
+                # ordinary function invocations all share the same node type.
+                # Dispatch via _extract_elixir_constructs so we can tell them
+                # apart by the first-identifier text and still recurse into
+                # bodies with the correct enclosing scope. See: #112
+                if language == "elixir" and node_type == "call":
+                    if self._extract_elixir_constructs(
+                        child, source, language, file_path, nodes, edges,
+                        enclosing_class, enclosing_func,
+                        import_map, defined_names, _depth,
+                    ):
+                        continue
+
+                # --- Nix-specific constructs ---
+                # Nix bindings (``attrpath = expr;``) are the graph's addressable
+                # things; dispatch via _extract_nix_constructs to flatten dotted
+                # attrpaths into Function nodes and to emit IMPORTS_FROM edges for
+                # flake ``inputs.*.url`` strings and ``import``/``callPackage``
+                # applications. See: #366 follow-up (flake-aware Nix support).
+                if language == "nix" and node_type == "binding":
+                    if self._extract_nix_constructs(
+                        child, source, language, file_path, nodes, edges,
+                        enclosing_class, enclosing_func,
+                        import_map, defined_names, _depth,
+                    ):
+                        continue
+
+                # --- HCL/Terraform-specific constructs ---
+                # All Terraform top-level constructs are ``block`` nodes whose
+                # first identifier child labels the block type (resource, module,
+                # variable, data, output, locals, provider, terraform).  Dispatch
+                # via _extract_hcl_constructs to produce Class, Function, and
+                # IMPORTS_FROM/REFERENCES edges.  See issue #199.
+                if language == "hcl" and node_type == "block":
+                    if self._extract_hcl_constructs(
+                        child, file_path, nodes, edges,
+                    ):
+                        continue
+
+                # --- Julia-specific constructs ---
+                # Short-form functions (`f(x) = expr`) parse as ``assignment``,
+                # ``include("file.jl")`` as a call_expression, exports as
+                # ``export_statement``, and macrocalls (including ``@testset``)
+                # need recursion into bodies that may themselves contain
+                # function definitions (e.g. ``@inline function f ... end``).
+                if language == "julia" and self._extract_julia_constructs(
+                    child, node_type, source, language, file_path,
+                    nodes, edges, enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
                 ):
                     continue
 
-            # --- Julia-specific constructs ---
-            # Short-form functions (`f(x) = expr`) parse as ``assignment``,
-            # ``include("file.jl")`` as a call_expression, exports as
-            # ``export_statement``, and macrocalls (including ``@testset``)
-            # need recursion into bodies that may themselves contain
-            # function definitions (e.g. ``@inline function f ... end``).
-            if language == "julia" and self._extract_julia_constructs(
-                child, node_type, source, language, file_path,
-                nodes, edges, enclosing_class, enclosing_func,
-                import_map, defined_names, _depth,
-            ):
-                continue
-
-            # --- Verilog/SystemVerilog structural declarations ---
-            if language == "verilog" and self._extract_verilog_constructs(
-                child,
-                node_type,
-                file_path,
-                nodes,
-                edges,
-                enclosing_class,
-                enclosing_func,
-            ):
-                continue
-
-            if language == "rust" and node_type == "impl_item":
-                self._extract_rust_impl(
+                # --- Verilog/SystemVerilog structural declarations ---
+                if language == "verilog" and self._extract_verilog_constructs(
                     child,
-                    source,
+                    node_type,
                     file_path,
                     nodes,
                     edges,
-                    import_map or {},
-                    defined_names or set(),
-                    _depth,
-                )
-                continue
+                    enclosing_class,
+                    enclosing_func,
+                ):
+                    continue
+
+                if language == "rust" and node_type == "impl_item":
+                    self._extract_rust_impl(
+                        child,
+                        source,
+                        file_path,
+                        nodes,
+                        edges,
+                        import_map or {},
+                        defined_names or set(),
+                        _depth,
+                    )
+                    continue
 
             # --- Dart call detection (see #87) ---
             # tree-sitter-dart does not wrap calls in a single
@@ -7880,7 +7934,7 @@ class CodeParser:
             # ``identifier + selector > argument_part`` as siblings inside
             # the parent.  Scan child's children here and emit CALLS edges
             # for any we find; nested calls are handled by the main recursion.
-            if language == "dart":
+            if is_dart:
                 self._extract_dart_calls_from_children(
                     child, source, file_path, edges,
                     enclosing_class, enclosing_func,
@@ -7891,14 +7945,14 @@ class CodeParser:
             # Dynamic templates and path.join/path.resolve expressions are
             # intentionally left unresolved rather than guessed.
             if (
-                language in ("javascript", "typescript", "tsx")
+                is_js
                 and node_type == "call_expression"
             ):
                 self._extract_js_module_call(child, file_path, language, edges)
 
             # --- JS/TS variable-assigned functions (const foo = () => {}) ---
             if (
-                language in ("javascript", "typescript", "tsx")
+                is_js
                 and node_type in ("lexical_declaration", "variable_declaration")
                 and self._extract_js_var_functions(
                     child, source, language, file_path, nodes, edges,
@@ -7918,7 +7972,7 @@ class CodeParser:
 
             # --- JS/TS class field arrow functions (handler = () => {}) ---
             if (
-                language in ("javascript", "typescript", "tsx")
+                is_js
                 and node_type == "public_field_definition"
                 and self._extract_js_field_function(
                     child, source, language, file_path, nodes, edges,
@@ -7930,7 +7984,7 @@ class CodeParser:
 
             # --- JS/TS member-assigned functions (app.handle = function () {}) ---
             if (
-                language in ("javascript", "typescript", "tsx")
+                is_js
                 and node_type == "expression_statement"
                 and self._extract_js_member_functions(
                     child, source, language, file_path, nodes, edges,
@@ -7970,7 +8024,7 @@ class CodeParser:
 
             # --- JSX component invocations ---
             if (
-                language in ("javascript", "typescript", "tsx")
+                is_js
                 and node_type in ("jsx_opening_element", "jsx_self_closing_element")
             ):
                 self._extract_jsx_component_call(
@@ -7980,7 +8034,7 @@ class CodeParser:
                 )
 
             # --- TS type-position references ---
-            if language in ("typescript", "tsx") and node_type == "type_identifier":
+            if is_ts and node_type == "type_identifier":
                 self._extract_ts_type_reference(
                     child, language, file_path, edges,
                     enclosing_class, enclosing_func,
@@ -7988,28 +8042,26 @@ class CodeParser:
                 )
 
             # --- Value references (function-as-value in maps, arrays, args) ---
-            self._extract_value_references(
-                child, node_type, source, language, file_path, edges,
-                enclosing_class, enclosing_func,
-                import_map, defined_names,
-            )
+            if node_type in value_ref_types:
+                self._extract_value_references(
+                    child, node_type, source, language, file_path, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names,
+                )
 
             # --- Solidity-specific constructs ---
-            if language == "solidity" and self._extract_solidity_constructs(
+            if is_solidity and self._extract_solidity_constructs(
                 child, node_type, source, file_path, nodes, edges,
                 enclosing_class, enclosing_func,
             ):
                 continue
 
             # Recurse for other node types
-            self._extract_from_tree(
-                child, source, language, file_path, nodes, edges,
-                enclosing_class=enclosing_class,
-                enclosing_func=enclosing_func,
-                import_map=import_map, defined_names=defined_names,
-                _depth=_depth + 1,
-                _go_receiver_bindings=_go_receiver_bindings,
-            )
+            if descend and child.child_count:
+                push(None)
+                extend(child.children[::-1])
+                _depth += 1
+                descend = _depth < max_depth
 
     def _elixir_call_identifier(self, node) -> Optional[str]:
         """Return the leading identifier of an Elixir ``call`` node.
