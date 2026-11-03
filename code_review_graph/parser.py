@@ -2645,9 +2645,12 @@ def _csharp_namespaces(root_node) -> list[str]:
                         )
                         namespaces.append(current_namespace)
                     break
+        # Namespace declarations are named nodes, and an error-free subtree
+        # without the keyword cannot hold one.
         stack.extend(
             (child, current_namespace)
-            for child in reversed(node.children)
+            for child in reversed(node.named_children)
+            if child.has_error or b"namespace" in child.text
         )
     return namespaces
 
