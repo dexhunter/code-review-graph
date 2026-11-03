@@ -707,6 +707,15 @@ class GraphStore:
             conn.execute("PRAGMA busy_timeout=5000")
             _assert_usable_database(conn, self.db_path)
             self._conn = conn
+            # A brand-new file holds nothing to protect yet. In WAL mode
+            # synchronous=NORMAL skips the per-commit fsync but still syncs
+            # at checkpoints, so the schema and migrations are written
+            # cheaply; the caller-visible setting is restored afterwards. On
+            # failure the connection is closed below, so no restore is needed.
+            fresh_sync = None
+            if get_schema_version(conn) == 0:
+                fresh_sync = conn.execute("PRAGMA synchronous").fetchone()[0]
+                conn.execute("PRAGMA synchronous=NORMAL")
             self._init_schema()
             # Ensure schema_version is set, then run pending migrations
             if get_schema_version(self._conn) < 1:
@@ -717,6 +726,8 @@ class GraphStore:
                 )
                 self._conn.commit()
             run_migrations(self._conn)
+            if fresh_sync is not None:
+                conn.execute(f"PRAGMA synchronous={int(fresh_sync)}")
         except (sqlite3.Error, OSError, GraphStoreError) as exc:
             # A corrupt file, a foreign SQLite file, or a data directory this
             # process cannot write to used to escape as a raw traceback from
